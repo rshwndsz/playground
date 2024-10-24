@@ -38,12 +38,8 @@ def layer_norm(x, gamma, beta, eps=1e-5):
 def mhsa(x, mask, h, W_QKV, b_QKV, W_O, b_O):
     S, d = x.shape
 
-    W_Q, W_K, W_V = jnp.split(W_QKV, 3, axis=-1)
-    b_Q, b_K, b_V = jnp.split(b_QKV, 3, axis=-1)
-
-    Q = jnp.dot(x, W_Q) + b_Q
-    K = jnp.dot(x, W_K) + b_K
-    V = jnp.dot(x, W_V) + b_V
+    QKV = jnp.dot(x, W_QKV) + b_QKV
+    Q, K, V = jnp.split(QKV, 3, axis=-1)
 
     Q = Q.reshape(S, d // h, h).transpose(2, 0, 1)
     K = K.reshape(S, d // h, h).transpose(2, 0, 1)
