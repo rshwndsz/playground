@@ -3,6 +3,7 @@ from dataclasses import dataclass
 
 import jax
 import jax.numpy as jnp
+import jax.random as jrn
 from safetensors.flax import load
 from transformers import AutoTokenizer
 
@@ -63,7 +64,9 @@ def mhsa(x, mask, h, W_QKV, b_QKV, W_O, b_O):
     #     [ 0,    0,    0, -inf],  # 'to' can attend to 'I', 'love', 'to'
     #     [ 0,    0,    0,    0],  # 'code' can attend to 'I', 'love', 'to', 'code'
     # ]
-    mask = jnp.triu(jnp.ones((S, S)), k=1) * (-jnp.inf)
+
+    #  Use -1e8 instead of -jnp.inf to avoid nan
+    mask = jnp.triu(jnp.ones((S, S)), k=1) * (-1e8)
     scores += mask
 
     scores = jax.nn.softmax(scores, axis=-1)
@@ -123,12 +126,23 @@ def xfmr(tokens, mask, weights, params):
     return logits
 
 
-def sample(logits):
-    token = jnp.argmax(jax.nn.softmax(logits))
-    return token
+def sample(logits, key=None, temperature=0.0, k=8):
+    if temperature == 0.0:
+        probs = jax.nn.softmax(logits)
+        token = jnp.argmax(probs)
+    else:
+        assert key is not None
+        temperature = max(temperature, 1e-8)
+        logits /= temperature
+        probs = jax.nn.softmax(logits)
+        token = jrn.choice(key, a=len(probs), p=probs)
+    top_k = jnp.argsort(probs)[::-1][:k]
+    return token, top_k
 
 
 def main(args):
+    key = jrn.key(args.key)
+
     tokenizer = AutoTokenizer.from_pretrained("openai-community/gpt2")
     tokenizer.pad_token = tokenizer.eos_token
     inputs = tokenizer(
@@ -141,8 +155,10 @@ def main(args):
     params = Params(n=12, h=12, d=768, d_ff=3072, v=50257)
 
     for _ in range(args.len):
+        _, key = jrn.split(key)
         outputs = xfmr(tokens, mask, weights, params)
-        gen = sample(outputs)
+        gen, top_k = sample(outputs, key, args.temperature, args.k)
+
         print(tokenizer.decode([int(gen)]), end="", flush=True)
 
         pos = len(jnp.nonzero(mask)[0])
@@ -155,6 +171,9 @@ if __name__ == "__main__":
     parser.add_argument("--weights", type=str, required=True)
     parser.add_argument("--prompt", type=str, required=True)
     parser.add_argument("--len", type=int, default=50)
+    parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--k", type=int, default=8)
+    parser.add_argument("--key", type=int, default=42)
     parser.add_argument("--device", type=str)
     args = parser.parse_args()
 
