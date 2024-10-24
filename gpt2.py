@@ -4,8 +4,27 @@ from dataclasses import dataclass
 import jax
 import jax.numpy as jnp
 import jax.random as jrn
+from rich.console import Console
 from safetensors.flax import load
 from transformers import AutoTokenizer
+
+
+def colourise(words, probs, primary_color="red", end=" ", add_newline=False):
+    console = Console()
+    words = [word.replace(" ", "_") for word in words]
+    for i, (word, prob) in enumerate(zip(words, probs)):
+        if primary_color == "blue":
+            b, r, g = max(int((prob * 1e5) % 255), 40), 0, 0
+        elif primary_color == "red":
+            r, g, b = max(int((prob * 1e5) % 255), 40), 0, 0
+        elif primary_color == "green":
+            g, r, b = max(int((prob * 1e5) % 255), 40), 0, 0
+        else:
+            raise NotImplementedError()
+        color = f"#{r:02x}{g:02x}{b:02x}"
+        console.print(f"[{color}]{word}[/]", end=end)
+    if add_newline:
+        console.print()
 
 
 @dataclass
@@ -137,7 +156,7 @@ def sample(logits, key=None, temperature=0.0, k=8):
         probs = jax.nn.softmax(logits)
         token = jrn.choice(key, a=len(probs), p=probs)
     top_k = jnp.argsort(probs)[::-1][:k]
-    return token, top_k
+    return token, top_k, probs
 
 
 def main(args):
@@ -157,9 +176,22 @@ def main(args):
     for _ in range(args.len):
         _, key = jrn.split(key)
         outputs = xfmr(tokens, mask, weights, params)
-        gen, top_k = sample(outputs, key, args.temperature, args.k)
+        gen, top_k, probs = sample(outputs, key, args.temperature, args.k)
 
-        print(tokenizer.decode([int(gen)]), end="", flush=True)
+        top_k = [int(x) for x in top_k]
+        gen = int(gen)
+        colourise(
+            [tokenizer.decode([x]) for x in top_k],
+            probs[jnp.array(top_k)],
+            primary_color="green",
+            add_newline=True,
+        )
+        colourise(
+            [tokenizer.decode([gen])],
+            [probs[gen]],
+            primary_color="red",
+            add_newline=True,
+        )
 
         pos = len(jnp.nonzero(mask)[0])
         tokens = tokens.at[pos].set(gen)
