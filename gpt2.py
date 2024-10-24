@@ -9,24 +9,6 @@ from safetensors.flax import load
 from transformers import AutoTokenizer
 
 
-def colourise(words, probs, primary_color="red", end=" ", add_newline=False):
-    console = Console()
-    words = [word.replace(" ", "_") for word in words]
-    for i, (word, prob) in enumerate(zip(words, probs)):
-        if primary_color == "blue":
-            b, r, g = max(int((prob * 1e5) % 255), 40), 0, 0
-        elif primary_color == "red":
-            r, g, b = max(int((prob * 1e5) % 255), 40), 0, 0
-        elif primary_color == "green":
-            g, r, b = max(int((prob * 1e5) % 255), 40), 0, 0
-        else:
-            raise NotImplementedError()
-        color = f"#{r:02x}{g:02x}{b:02x}"
-        console.print(f"[{color}]{word}[/]", end=end)
-    if add_newline:
-        console.print()
-
-
 @dataclass
 class Params:
     n: int
@@ -37,14 +19,7 @@ class Params:
 
 
 def gelu(x):
-    return (
-        0.5
-        * x
-        * (
-            1.0
-            + jnp.tanh(jnp.sqrt(2.0 / jnp.pi) * (x + 0.044715 * jnp.pow(x, 3)))
-        )
-    )
+    return 0.5 * x * (1.0 + jnp.tanh(jnp.sqrt(2.0 / jnp.pi) * (x + 0.044715 * jnp.pow(x, 3))))
 
 
 def ffn(x, W1, b1, W2, b2):
@@ -159,14 +134,30 @@ def sample(logits, key=None, temperature=0.0, k=8):
     return token, top_k, probs
 
 
-def main(args):
+def colourise(words, probs, primary_color="red", end=" ", add_newline=False):
+    console = Console()
+    words = [word.replace(" ", "_") for word in words]
+    for i, (word, prob) in enumerate(zip(words, probs)):
+        if primary_color == "blue":
+            b, r, g = max(int((prob * 1e5) % 255), 40), 0, 0
+        elif primary_color == "red":
+            r, g, b = max(int((prob * 1e5) % 255), 40), 0, 0
+        elif primary_color == "green":
+            g, r, b = max(int((prob * 1e5) % 255), 40), 0, 0
+        else:
+            raise NotImplementedError()
+        color = f"#{r:02x}{g:02x}{b:02x}"
+        console.print(f"[{color}]{word}[/]", end=end)
+    if add_newline:
+        console.print()
+
+
+def inference(args):
     key = jrn.key(args.key)
 
     tokenizer = AutoTokenizer.from_pretrained("openai-community/gpt2")
     tokenizer.pad_token = tokenizer.eos_token
-    inputs = tokenizer(
-        args.prompt, padding="max_length", max_length=1024, truncation=True
-    )
+    inputs = tokenizer(args.prompt, padding="max_length", max_length=1024, truncation=True)
     tokens, mask = inputs["input_ids"], inputs["attention_mask"]
     tokens, mask = jnp.array(tokens), jnp.array(mask)
 
@@ -209,4 +200,4 @@ if __name__ == "__main__":
     parser.add_argument("--device", type=str)
     args = parser.parse_args()
 
-    main(args)
+    inference(args)
