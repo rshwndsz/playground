@@ -34,7 +34,7 @@ def ffn(x, W1, b1, W2, b2):
     return x
 
 
-def layer_norm(x, gamma, beta, eps=1e-8):
+def layer_norm(x, gamma, beta, eps=1e-5):
     mean = jnp.mean(x, axis=0).reshape(1, -1)
     std = jnp.std(x, axis=0).reshape(1, -1)
     return gamma * ((x - mean) / (std + eps)) + beta.reshape(1, -1)
@@ -57,12 +57,16 @@ def mhsa(x, mask, h, W_QKV, b_QKV, W_O, b_O):
     scores = jnp.einsum("hik, hjk -> hij", Q, K)
     scores /= jnp.sqrt(d)
 
-    # TODO: There should be a more efficient way than tiling & branching
-    mask = jnp.triu(jnp.tile(jnp.array(mask), (len(mask), 1)))
-    mask = jnp.where(mask == 1.0, -jnp.inf, 0.0)
+    # [
+    #     [ 0, -inf, -inf, -inf],  # 'I' can only attend to itself
+    #     [ 0,    0, -inf, -inf],  # 'love' can attend to 'I' and itself
+    #     [ 0,    0,    0, -inf],  # 'to' can attend to 'I', 'love', 'to'
+    #     [ 0,    0,    0,    0],  # 'code' can attend to 'I', 'love', 'to', 'code'
+    # ]
+    mask = jnp.triu(jnp.ones((S, S)), k=1) * (-jnp.inf)
     scores += mask
 
-    scores = jax.nn.softmax(scores)
+    scores = jax.nn.softmax(scores, axis=-1)
     attention = jnp.einsum("hsi, hsj -> sjh", scores, V)
     attention = attention.reshape(S, d)
 
@@ -73,42 +77,49 @@ def mhsa(x, mask, h, W_QKV, b_QKV, W_O, b_O):
 def xfmr(tokens, mask, weights, params):
     w = weights
 
-    x = w["wte.weight"][jnp.array(tokens)] + w["wpe.weight"]
+    word_embed = w["wte.weight"]
+    posn_embed = w["wpe.weight"]
+
+    x = word_embed[jnp.array(tokens)] + posn_embed
     for i in range(params.n):
-        x += layer_norm(
-            mhsa(
+        x += mhsa(
+            layer_norm(
                 x,
-                mask,
-                params.h,
-                w[f"h.{i}.attn.c_attn.weight"],
-                w[f"h.{i}.attn.c_attn.bias"],
-                w[f"h.{i}.attn.c_proj.weight"],
-                w[f"h.{i}.attn.c_proj.bias"],
+                gamma=w[f"h.{i}.ln_1.weight"],
+                beta=w[f"h.{i}.ln_1.bias"],
             ),
-            w[f"h.{i}.ln_1.weight"],
-            w[f"h.{i}.ln_1.bias"],
+            mask,
+            h=params.h,
+            W_QKV=w[f"h.{i}.attn.c_attn.weight"],
+            b_QKV=w[f"h.{i}.attn.c_attn.bias"],
+            W_O=w[f"h.{i}.attn.c_proj.weight"],
+            b_O=w[f"h.{i}.attn.c_proj.bias"],
         )
-        x += layer_norm(
-            ffn(
+
+        x += ffn(
+            layer_norm(
                 x,
-                w[f"h.{i}.mlp.c_fc.weight"],
-                w[f"h.{i}.mlp.c_fc.bias"],
-                w[f"h.{i}.mlp.c_proj.weight"],
-                w[f"h.{i}.mlp.c_proj.bias"],
+                gamma=w[f"h.{i}.ln_2.weight"],
+                beta=w[f"h.{i}.ln_2.bias"],
             ),
-            w[f"h.{i}.ln_2.weight"],
-            w[f"h.{i}.ln_2.bias"],
+            W1=w[f"h.{i}.mlp.c_fc.weight"],
+            b1=w[f"h.{i}.mlp.c_fc.bias"],
+            W2=w[f"h.{i}.mlp.c_proj.weight"],
+            b2=w[f"h.{i}.mlp.c_proj.bias"],
         )
-    x = layer_norm(x, w["ln_f.weight"], w["ln_f.bias"])
+
+    # GPT-2 has a layer norm at the output
+    x = layer_norm(x, gamma=w["ln_f.weight"], beta=w["ln_f.bias"])
 
     # lm_head is tied to wte.weight
-    x = jnp.einsum("ik, jk -> ij", x, w["wte.weight"])
+    x = jnp.einsum("ik, jk -> ij", x, word_embed)
 
     # for a batch of sequences with a specific length,
     # the model will output logits for each token position in the input
     # indicating the likelihood of each token in the vocab being the next token.
     # we select the last token
     logits = x[-1, :]
+
     return logits
 
 
@@ -132,7 +143,7 @@ def main(args):
     for _ in range(args.len):
         outputs = xfmr(tokens, mask, weights, params)
         gen = sample(outputs)
-        print(tokenizer.decode([gen]), end="", flush=True)
+        print(tokenizer.decode([int(gen)]), end="", flush=True)
 
         pos = len(jnp.nonzero(mask)[0])
         tokens = tokens.at[pos].set(gen)
