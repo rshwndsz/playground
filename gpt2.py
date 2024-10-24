@@ -16,10 +16,21 @@ class Params:
     v: int
 
 
+def gelu(x):
+    return (
+        0.5
+        * x
+        * (
+            1.0
+            + jnp.tanh(jnp.sqrt(2.0 / jnp.pi) * (x + 0.044715 * jnp.pow(x, 3)))
+        )
+    )
+
+
 def ffn(x, W1, b1, W2, b2):
-    act = jax.nn.relu
-    x = act(jnp.einsum("ik, kj -> ij", x, W1)) + b1
-    x = act(jnp.einsum("ik, kj -> ij", x, W2)) + b2
+    act = gelu
+    x = act(jnp.einsum("ik, kj -> ij", x, W1) + b1)
+    x = jnp.einsum("ik, kj -> ij", x, W2) + b2
     return x
 
 
