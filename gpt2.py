@@ -4,9 +4,9 @@ from dataclasses import dataclass
 import jax
 import jax.numpy as jnp
 import jax.random as jrn
+import tiktoken
 from rich.console import Console
 from safetensors.flax import load
-from transformers import AutoTokenizer
 
 
 @dataclass
@@ -23,57 +23,50 @@ def gelu(x):
 
 
 def ffn(x, W1, b1, W2, b2):
-    act = gelu
-    x = act(jnp.einsum("ik, kj -> ij", x, W1) + b1)
+    x = gelu(jnp.einsum("ik, kj -> ij", x, W1) + b1)
     x = jnp.einsum("ik, kj -> ij", x, W2) + b2
     return x
 
 
 def layer_norm(x, gamma, beta, eps=1e-5):
-    mean = jnp.mean(x, axis=0).reshape(1, -1)
-    std = jnp.std(x, axis=0).reshape(1, -1)
-    return gamma * ((x - mean) / (std + eps)) + beta.reshape(1, -1)
+    mean = jnp.mean(x, axis=-1, keepdims=True)
+    var = jnp.var(x, axis=-1, keepdims=True)
+    return gamma * (x - mean) / jnp.sqrt(var + eps) + beta
 
 
-def mhsa(x, mask, h, W_QKV, b_QKV, W_O, b_O):
+def mhsa(x, h, W_QKV, b_QKV, W_O, b_O):
     S, d = x.shape
 
-    QKV = jnp.dot(x, W_QKV) + b_QKV
+    QKV = jnp.einsum("ik, kj -> ij", x, W_QKV) + b_QKV
     Q, K, V = jnp.split(QKV, 3, axis=-1)
 
-    Q = Q.reshape(S, d // h, h).transpose(2, 0, 1)
-    K = K.reshape(S, d // h, h).transpose(2, 0, 1)
-    V = V.reshape(S, d // h, h).transpose(2, 0, 1)
+    Q = Q.reshape(S, h, d // h).transpose(1, 0, 2)
+    K = K.reshape(S, h, d // h).transpose(1, 0, 2)
+    V = V.reshape(S, h, d // h).transpose(1, 0, 2)
 
     scores = jnp.einsum("hik, hjk -> hij", Q, K)
-    scores /= jnp.sqrt(d)
+    # Divide by the head's d_k dimension
+    scores /= jnp.sqrt(d // h)
 
-    # [
-    #     [ 0, -inf, -inf, -inf],  # 'I' can only attend to itself
-    #     [ 0,    0, -inf, -inf],  # 'love' can attend to 'I' and itself
-    #     [ 0,    0,    0, -inf],  # 'to' can attend to 'I', 'love', 'to'
-    #     [ 0,    0,    0,    0],  # 'code' can attend to 'I', 'love', 'to', 'code'
-    # ]
-
-    #  Use -1e8 instead of -jnp.inf to avoid nan
-    mask = jnp.triu(jnp.ones((S, S)), k=1) * (-1e8)
+    #  Use -1e10 instead of -jnp.inf to avoid nan
+    mask = jnp.triu(jnp.ones((S, S)), k=1) * (-1e10)
     scores += mask
 
     scores = jax.nn.softmax(scores, axis=-1)
     attention = jnp.einsum("hsi, hsj -> sjh", scores, V)
-    attention = attention.reshape(S, d)
+    attention = attention.transpose(1, 0, 2).reshape(S, d)
 
-    out = jnp.dot(attention, W_O) + b_O
+    out = jnp.einsum("sk, kj -> sj", attention, W_O) + b_O
     return out
 
 
-def xfmr(tokens, mask, weights, params):
+def xfmr(tokens, weights, params):
     w = weights
 
     word_embed = w["wte.weight"]
     posn_embed = w["wpe.weight"]
 
-    x = word_embed[jnp.array(tokens)] + posn_embed
+    x = word_embed[jnp.array(tokens)] + posn_embed[jnp.arange(len(tokens))]
     for i in range(params.n):
         x += mhsa(
             layer_norm(
@@ -81,7 +74,6 @@ def xfmr(tokens, mask, weights, params):
                 gamma=w[f"h.{i}.ln_1.weight"],
                 beta=w[f"h.{i}.ln_1.bias"],
             ),
-            mask,
             h=params.h,
             W_QKV=w[f"h.{i}.attn.c_attn.weight"],
             b_QKV=w[f"h.{i}.attn.c_attn.bias"],
@@ -116,21 +108,20 @@ def xfmr(tokens, mask, weights, params):
     return logits
 
 
-def sample(logits, key=None, temperature=0.0, k=8):
-    if temperature == 0.0:
-        probs = jax.nn.softmax(logits)
-        token = jnp.argmax(probs)
-    else:
-        assert key is not None
-        temperature = max(temperature, 1e-8)
-        logits /= temperature
-        probs = jax.nn.softmax(logits)
-        token = jrn.choice(key, a=len(probs), p=probs)
-    top_k = jnp.argsort(probs)[::-1][:k]
-    return token, top_k, probs
+def sample(logits, key, k=50):
+    _, key = jrn.split(key)
+    probs = jax.nn.softmax(logits)
+    topk_probs, topk_indices = jax.lax.top_k(probs, k)
+
+    topk_probs /= jnp.sum(topk_probs)
+
+    sampled = jrn.choice(key, a=len(topk_probs), p=topk_probs)
+    token = int(topk_indices[sampled])
+    topk = [int(ix) for ix in topk_indices]
+    return token, topk, topk_probs
 
 
-def colourise(words, probs, primary_color="red", end=" ", add_newline=False):
+def colourise(words, probs, primary_color="red", end=" ", add_newline=True):
     console = Console()
     words = [word.replace(" ", "_") for word in words]
     for i, (word, prob) in enumerate(zip(words, probs)):
@@ -151,38 +142,23 @@ def colourise(words, probs, primary_color="red", end=" ", add_newline=False):
 def inference(args):
     key = jrn.key(args.key)
 
-    tokenizer = AutoTokenizer.from_pretrained("openai-community/gpt2")
-    tokenizer.pad_token = tokenizer.eos_token
-    inputs = tokenizer(args.prompt, padding="max_length", max_length=1024, truncation=True)
-    tokens, mask = inputs["input_ids"], inputs["attention_mask"]
-    tokens, mask = jnp.array(tokens), jnp.array(mask)
+    enc = tiktoken.get_encoding("gpt2")
+    tokens = enc.encode(args.prompt)
 
     weights = load(open(args.weights, "rb").read())
     params = Params(n=12, h=12, d=768, d_ff=3072, v=50257)
 
     for _ in range(args.len):
         _, key = jrn.split(key)
-        outputs = xfmr(tokens, mask, weights, params)
-        gen, top_k, probs = sample(outputs, key, args.temperature, args.k)
+        outputs = xfmr(tokens, weights, params)
+        gen, topk, topk_probs = sample(outputs, key)
 
-        top_k = [int(x) for x in top_k]
-        gen = int(gen)
-        colourise(
-            [tokenizer.decode([x]) for x in top_k],
-            probs[jnp.array(top_k)],
-            primary_color="green",
-            add_newline=True,
-        )
-        colourise(
-            [tokenizer.decode([gen])],
-            [probs[gen]],
-            primary_color="red",
-            add_newline=True,
-        )
-
-        pos = len(jnp.nonzero(mask)[0])
-        tokens = tokens.at[pos].set(gen)
-        mask = mask.at[pos].set(1)
+        if args.show_topk:
+            colourise([enc.decode([tok]) for tok in topk], topk_probs)
+            print(enc.decode([gen]), end="\n", flush=True)
+        else:
+            print(enc.decode([gen]), end="\n", flush=True)
+        tokens.append(gen)
 
 
 if __name__ == "__main__":
@@ -190,9 +166,8 @@ if __name__ == "__main__":
     parser.add_argument("--weights", type=str, required=True)
     parser.add_argument("--prompt", type=str, required=True)
     parser.add_argument("--len", type=int, default=50)
-    parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--k", type=int, default=8)
     parser.add_argument("--key", type=int, default=42)
+    parser.add_argument("--show-topk", action="store_true")
     parser.add_argument("--device", type=str)
     args = parser.parse_args()
 
