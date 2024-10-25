@@ -6,7 +6,7 @@ import jax.numpy as jnp
 import jax.random as jrn
 import tiktoken
 from rich.console import Console
-from safetensors.flax import load
+from transformers import GPT2LMHeadModel
 
 
 @dataclass
@@ -53,7 +53,7 @@ def mhsa(x, h, W_QKV, b_QKV, W_O, b_O):
     scores += mask
 
     scores = jax.nn.softmax(scores, axis=-1)
-    attention = jnp.einsum("hsi, hsj -> sjh", scores, V)
+    attention = jnp.einsum("hik, hkj -> hij", scores, V)
     attention = attention.transpose(1, 0, 2).reshape(S, d)
 
     out = jnp.einsum("sk, kj -> sj", attention, W_O) + b_O
@@ -63,65 +63,73 @@ def mhsa(x, h, W_QKV, b_QKV, W_O, b_O):
 def xfmr(tokens, weights, params):
     w = weights
 
-    word_embed = w["wte.weight"]
-    posn_embed = w["wpe.weight"]
+    word_embed = w["transformer.wte.weight"]
+    posn_embed = w["transformer.wpe.weight"]
 
-    x = word_embed[jnp.array(tokens)] + posn_embed[jnp.arange(len(tokens))]
+    x = word_embed[jnp.array(tokens)] + posn_embed[jnp.array(range(len(tokens)))]
     for i in range(params.n):
         x += mhsa(
             layer_norm(
                 x,
-                gamma=w[f"h.{i}.ln_1.weight"],
-                beta=w[f"h.{i}.ln_1.bias"],
+                gamma=w[f"transformer.h.{i}.ln_1.weight"],
+                beta=w[f"transformer.h.{i}.ln_1.bias"],
             ),
             h=params.h,
-            W_QKV=w[f"h.{i}.attn.c_attn.weight"],
-            b_QKV=w[f"h.{i}.attn.c_attn.bias"],
-            W_O=w[f"h.{i}.attn.c_proj.weight"],
-            b_O=w[f"h.{i}.attn.c_proj.bias"],
+            W_QKV=w[f"transformer.h.{i}.attn.c_attn.weight"],
+            b_QKV=w[f"transformer.h.{i}.attn.c_attn.bias"],
+            W_O=w[f"transformer.h.{i}.attn.c_proj.weight"],
+            b_O=w[f"transformer.h.{i}.attn.c_proj.bias"],
         )
 
         x += ffn(
             layer_norm(
                 x,
-                gamma=w[f"h.{i}.ln_2.weight"],
-                beta=w[f"h.{i}.ln_2.bias"],
+                gamma=w[f"transformer.h.{i}.ln_2.weight"],
+                beta=w[f"transformer.h.{i}.ln_2.bias"],
             ),
-            W1=w[f"h.{i}.mlp.c_fc.weight"],
-            b1=w[f"h.{i}.mlp.c_fc.bias"],
-            W2=w[f"h.{i}.mlp.c_proj.weight"],
-            b2=w[f"h.{i}.mlp.c_proj.bias"],
+            W1=w[f"transformer.h.{i}.mlp.c_fc.weight"],
+            b1=w[f"transformer.h.{i}.mlp.c_fc.bias"],
+            W2=w[f"transformer.h.{i}.mlp.c_proj.weight"],
+            b2=w[f"transformer.h.{i}.mlp.c_proj.bias"],
         )
 
     # GPT-2 has a layer norm at the output
-    x = layer_norm(x, gamma=w["ln_f.weight"], beta=w["ln_f.bias"])
+    x = layer_norm(
+        x,
+        gamma=w["transformer.ln_f.weight"],
+        beta=w["transformer.ln_f.bias"],
+    )
 
     # lm_head is tied to wte.weight
-    x = jnp.einsum("ik, jk -> ij", x, word_embed)
+    logits = jnp.einsum("ik, jk -> ij", x, w["lm_head.weight"])
 
     # for a batch of sequences with a specific length,
     # the model will output logits for each token position in the input
     # indicating the likelihood of each token in the vocab being the next token.
     # we select the last token
-    logits = x[-1, :]
-
-    return logits
+    return logits[-1, :]
 
 
 def sample(logits, key, k=50):
     _, key = jrn.split(key)
     probs = jax.nn.softmax(logits)
+
+    # Select top-k tokens
     topk_probs, topk_indices = jax.lax.top_k(probs, k)
 
+    # Renormalize distribution
     topk_probs /= jnp.sum(topk_probs)
 
+    # Sample a token from the top-k distribution
     sampled = jrn.choice(key, a=len(topk_probs), p=topk_probs)
+
     token = int(topk_indices[sampled])
+    token_prob = float(topk_probs[sampled])
     topk = [int(ix) for ix in topk_indices]
-    return token, topk, topk_probs
+    return token, token_prob, topk, topk_probs
 
 
-def colourise(words, probs, primary_color="red", end=" ", add_newline=True):
+def colorise(words, probs, primary_color="green", end=" ", add_newline=True):
     console = Console()
     words = [word.replace(" ", "_") for word in words]
     for i, (word, prob) in enumerate(zip(words, probs)):
@@ -145,25 +153,29 @@ def inference(args):
     enc = tiktoken.get_encoding("gpt2")
     tokens = enc.encode(args.prompt)
 
-    weights = load(open(args.weights, "rb").read())
+    # Use the GPT2 model to get the weights
+    model = GPT2LMHeadModel.from_pretrained("gpt2")
+    weights = model.state_dict()
+    # Convert the weights to JAX arrays
+    weights = {k: jnp.array(v.data.cpu().numpy()) for k, v in weights.items()}
+
     params = Params(n=12, h=12, d=768, d_ff=3072, v=50257)
 
     for _ in range(args.len):
         _, key = jrn.split(key)
         outputs = xfmr(tokens, weights, params)
-        gen, topk, topk_probs = sample(outputs, key)
+        gen, gen_prob, topk, topk_probs = sample(outputs, key)
 
         if args.show_topk:
-            colourise([enc.decode([tok]) for tok in topk], topk_probs)
+            colorise([enc.decode([tok]) for tok in topk], topk_probs)
             print(enc.decode([gen]), end="\n", flush=True)
         else:
-            print(enc.decode([gen]), end="\n", flush=True)
+            colorise([enc.decode([gen])], [gen_prob], end="", add_newline=False)
         tokens.append(gen)
 
 
 if __name__ == "__main__":
     parser = ArgumentParser()
-    parser.add_argument("--weights", type=str, required=True)
     parser.add_argument("--prompt", type=str, required=True)
     parser.add_argument("--len", type=int, default=50)
     parser.add_argument("--key", type=int, default=42)
