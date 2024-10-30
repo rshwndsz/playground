@@ -26,11 +26,13 @@ class Params:
 
 def rms_norm(x, gamma, eps=1e-8, axis=0):
     # https://arxiv.org/pdf/1910.07467
+    # https://github.com/meta-llama/llama-models/blob/2fe1a1690162910660332e3294a552cf0ec7e754/models/llama3/reference_impl/model.py#L31-L42
     return x * gamma / jnp.sqrt(jnp.mean(jnp.pow(x, 2), axis=axis, keepdims=True) + eps)
 
 
 def ffn(x, W1, V, W2):
     # https://arxiv.org/pdf/2002.05202v1
+    # https://github.com/meta-llama/llama-models/blob/2fe1a1690162910660332e3294a552cf0ec7e754/models/llama3/reference_impl/model.py#L218-L244
     def swish(x, beta: float):
         return x * jax.nn.sigmoid(beta * x, axis=-1)
 
@@ -41,12 +43,13 @@ def ffn(x, W1, V, W2):
 
 def rope():
     # https://arxiv.org/pdf/2104.09864
-
+    # https://github.com/meta-llama/llama-models/blob/2fe1a1690162910660332e3294a552cf0ec7e754/models/llama3/reference_impl/model.py#L45-L100
     pass
 
 
 def gqa(x, h, W_Q, W_K, W_V, W_O):
     # https://arxiv.org/pdf/2305.13245v3
+    # https://github.com/meta-llama/llama-models/blob/2fe1a1690162910660332e3294a552cf0ec7e754/models/llama3/reference_impl/model.py#L103-L215
     s, d = x.shape
 
     Q = jnp.einsum("ik, kj", x, W_Q).reshape(s, h, d // h).transpose(1, 0, 2)
@@ -69,6 +72,7 @@ def gqa(x, h, W_Q, W_K, W_V, W_O):
 
 
 def xfmr(tokens, weights, params):
+    # https://github.com/meta-llama/llama-models/blob/2fe1a1690162910660332e3294a552cf0ec7e754/models/llama3/reference_impl/model.py#L247-L334
     print(tokens)
 
     # x = W_E[jnp.array(tokens)] + rope(tokens)
