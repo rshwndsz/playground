@@ -32,48 +32,51 @@ def rms_norm(x, gamma, eps=1e-8, axis=0):
 
 
 def swish(x, beta: float):
-    return x * jax.nn.sigmoid(beta * x, axis=-1)
+    return x * jax.lax.logistic(beta * x)
 
 
 def ffn(x, W1, V, W2):
     # https://arxiv.org/pdf/2002.05202v1
     # https://github.com/meta-llama/llama-models/blob/2fe1a1690162910660332e3294a552cf0ec7e754/models/llama3/reference_impl/model.py#L218-L244
-    x = swish(jnp.dot(x, W1), beta=1.0) * jnp.dot(x, V)
-    x = jnp.dot(x, W2)
+    # Pytorch's nn.Linear is equivalent to jnp.dot(x, W.T)
+    x = swish(jnp.dot(x, W1.T), beta=1.0) * jnp.dot(x, V.T)
+    x = jnp.dot(x, W2.T)
     return x
 
 
-def compute_rope_frequencies(k: int, s: int, theta: float):
+def compute_rope_frequencies(dim: int, end: int, theta: float):
     # https://github.com/meta-llama/llama-models/blob/2fe1a1690162910660332e3294a552cf0ec7e754/models/llama3/reference_impl/model.py#L45-L100
     # https://arxiv.org/pdf/2104.09864
-    m = jnp.arange(0, s)
-    t = jnp.pow(theta, -jnp.arange(0, k, 2) / k)
+    m = jnp.arange(end)
+    t = jnp.pow(theta, -jnp.arange(0, dim, 2)[: dim // 2] / dim)
     f = jnp.einsum("i, j -> ij", m, t)
     return jnp.cos(f) + 1j * jnp.sin(f)
 
 
 def rope(x, f):
-    x = x[..., ::2] + 1j * x[..., 1::2]
-    f = jnp.expand_dims(f, 1)
-    x_rotated = x * f
-    x[..., ::2], x[..., 1::2] = x_rotated.real(), x_rotated.imag()
-    return x
+    x_complex = x[..., ::2] + 1j * x[..., 1::2]
+    x_rotated = x_complex * f
+
+    x_out = jnp.zeros_like(x)
+    x_out.at[..., 0::2].set(x_rotated.real.astype(x))
+    x_out.at[..., 1::2].set(x_rotated.imag.astype(x))
+    return x_out
 
 
 def gqa(x, h, h_kv, W_Q, W_K, W_V, W_O, f):
     # https://arxiv.org/pdf/2305.13245v3
     # https://github.com/meta-llama/llama-models/blob/2fe1a1690162910660332e3294a552cf0ec7e754/models/llama3/reference_impl/model.py#L103-L215
-    s, d = x.shape
+    _, d = x.shape
 
     # Project
-    Q = jnp.einsum("ik, kj -> ij", x, W_Q)
-    K = jnp.einsum("ik, kj -> ij", x, W_K)
-    V = jnp.einsum("ik, kj -> ij", x, W_V)
+    Q = jnp.einsum("ik, jk -> ij", x, W_Q)
+    K = jnp.einsum("ik, jk -> ij", x, W_K)
+    V = jnp.einsum("ik, jk -> ij", x, W_V)
 
     # Split along head
-    Q = rearrange(Q, "s (head head_dim) -> head s head_dim", h=h)
-    K = rearrange(K, "s (head_kv head_dim) -> head_kv s head_dim", h=h_kv)
-    V = rearrange(V, "s (head_kv head_dim) -> head_kv s head_dim", h=h_kv)
+    Q = rearrange(Q, "s (head head_dim) -> head s head_dim", head=h)
+    K = rearrange(K, "s (head head_dim) -> head s head_dim", head=h_kv)
+    V = rearrange(V, "s (head head_dim) -> head s head_dim", head=h_kv)
 
     # Apply rotary embeddings
     Q = rope(Q, f)
@@ -83,11 +86,11 @@ def gqa(x, h, h_kv, W_Q, W_K, W_V, W_O, f):
     # TODO
 
     # Grouped Query / Repeated Key-Value
-    K = repeat(K, "s head_kv head_dim -> s (head_kv n_rep) head_dim", n_rep=h / h_kv)
-    V = repeat(V, "s head_kv head_dim -> s (head_kv n_rep) head_dim", n_rep=h / h_kv)
+    K = repeat(K, "head_kv s head_dim -> (head_kv n_rep) s head_dim", n_rep=h // h_kv)
+    V = repeat(V, "head_kv s head_dim -> (head_kv n_rep) s head_dim", n_rep=h // h_kv)
 
     # Query-Key Lookup
-    scores = jnp.einsum("hik, hkj -> hij", Q, K)
+    scores = jnp.einsum("hik, hjk -> hij", Q, K)
     scores /= jnp.sqrt(d // h)
 
     # Causal mask
@@ -99,19 +102,18 @@ def gqa(x, h, h_kv, W_Q, W_K, W_V, W_O, f):
 
     # Project to value space
     attention = jnp.einsum("hik, hkj -> hij", scores, V)
-    attention = attention.transpose(1, 0, 2).reshape(s, d)
+    attention = rearrange(attention, "head s head_dim -> s (head head_dim)")
 
     # Output projection
-    out = jnp.einsum("ik, kj -> ij", attention, W_O)
+    # >>> NOTE Shapes
+    out = jnp.einsum("ik, jk -> ij", attention, W_O)
     return out
 
 
 def xfmr(tokens, w, params):
     # https://github.com/meta-llama/llama-models/blob/2fe1a1690162910660332e3294a552cf0ec7e754/models/llama3/reference_impl/model.py#L247-L334
-    print(tokens)
-
     x = w["model.embed_tokens.weight"][jnp.array(tokens)]
-    f = compute_rope_frequencies(k=params.d // params.h, s=len(tokens), theta=params.rope_theta)
+    f = compute_rope_frequencies(dim=params.d // params.h, end=len(tokens), theta=params.rope_theta)
     for i in range(params.n):
         x += gqa(
             rms_norm(x, w[f"model.layers.{i}.input_layernorm.weight"]),
@@ -125,10 +127,11 @@ def xfmr(tokens, w, params):
         )
         x += ffn(
             rms_norm(x, w[f"model.layers.{i}.post_attention_layernorm.weight"]),
-            W1=w[f"model.layers.{i}.mlp.up_proj"].T,
-            W2=w[f"model.layers.{i}.mlp.down_proj"].T,
-            V=w[f"model.layers.{i}.mlp.gate_proj"].T,
+            W1=w[f"model.layers.{i}.mlp.up_proj.weight"],
+            W2=w[f"model.layers.{i}.mlp.down_proj.weight"],
+            V=w[f"model.layers.{i}.mlp.gate_proj.weight"],
         )
+
     x = rms_norm(x, w["model.norm.weight"])
     logits = jnp.einsum("ij, jk -> ik", x, w["model.embed_tokens.weight"].T)
     return logits[-1, :]
