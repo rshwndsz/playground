@@ -1,6 +1,6 @@
 import os
 from argparse import ArgumentParser
-from dataclasses import dataclass
+from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
@@ -15,24 +15,6 @@ from transformers import AutoTokenizer
 # Sebastian Raschka: https://github.com/rasbt/LLMs-from-scratch/blob/main/ch05/07_gpt_to_llama/standalone-llama32.ipynb
 
 
-@dataclass
-class Params:
-    v: int
-    n: int
-    d: int
-    h: int
-    h_kv: int
-    max_seq_len: int
-
-    norm_eps: float
-
-    rope_theta: float
-    rope_scaling: bool
-    rope_scale_factor: float
-    rope_high_freq_factor: float
-    rope_low_freq_factor: float
-
-
 def rms_norm(x, gamma, eps):
     # https://arxiv.org/pdf/1910.07467
     return gamma * x * jax.lax.rsqrt(jnp.mean(jnp.square(x), axis=-1, keepdims=True) + eps)
@@ -44,43 +26,16 @@ def swish(x, beta: float):
 
 def ffn(x, W1, V, W2):
     # https://arxiv.org/pdf/2002.05202v1
-    # Pytorch's nn.Linear is equivalent to jnp.dot(x, W.T)
     x = swish(jnp.dot(x, W1.T), beta=1.0) * jnp.dot(x, V.T)
     x = jnp.dot(x, W2.T)
     return x
 
 
-def rope_frequencies(dim, ctx_len, theta, use_scaling=False):
+def rope_frequencies(dim, ctx_len, theta):
     # https://arxiv.org/pdf/2104.09864
-    def rope_scaling(f):
-        # Weird scaling added in from grid search
-        scale_factor = 32.0
-        high_freq_factor = 4.0
-        low_freq_factor = 1.0
-        og_ctx_len = 8192
-
-        # Get wavelengths from frequencies
-        wl = 2 * jnp.pi / f
-
-        # Conditions on wavelength
-        is_low_wl = wl < (og_ctx_len / low_freq_factor)
-        is_high_wl = wl > (og_ctx_len / high_freq_factor)
-        is_bound_wl = ~(is_low_wl | is_high_wl)
-
-        # Scale frequencies based on conditions
-        scaled_f = jnp.copy(f)
-        scaled_f[is_high_wl] = f[is_high_wl] / scale_factor
-        if is_bound_wl.any():
-            smooth = (og_ctx_len / wl[is_bound_wl] - low_freq_factor) / (high_freq_factor - low_freq_factor)
-            scaled_f[is_bound_wl] = (1 - smooth) * f[is_bound_wl] / scale_factor + smooth * f[is_bound_wl]
-        return scaled_f
-
     m = jnp.arange(ctx_len, dtype=jnp.float32)
     t = 1.0 / (theta ** (jnp.arange(0, dim, 2, dtype=jnp.float32)[: (dim // 2)] / dim))
-    if use_scaling:
-        t = rope_scaling(t)
     f = jnp.einsum("i, j -> ij", m, t)
-
     f = jnp.concatenate([f, f], axis=-1)
     return jnp.cos(f), jnp.sin(f)
 
@@ -139,7 +94,7 @@ def xfmr(tokens, w, params, f_cos, f_sin, pos):
     f_cos, f_sin = f_cos[pos : pos + s], f_sin[pos : pos + s]
 
     for i in range(params.n):
-        r = x
+        r = jnp.copy(x)
         x = rms_norm(x, w[f"model.layers.{i}.input_layernorm.weight"], eps=params.norm_eps)
         x = gqa(
             x,
@@ -154,7 +109,7 @@ def xfmr(tokens, w, params, f_cos, f_sin, pos):
         )
         x += r
 
-        r = x
+        r = jnp.copy(x)
         x = rms_norm(x, w[f"model.layers.{i}.post_attention_layernorm.weight"], eps=params.norm_eps)
         x = ffn(
             x,
@@ -175,6 +130,7 @@ def xfmr(tokens, w, params, f_cos, f_sin, pos):
 
 
 def sample(logits, key, temperature=0.6):
+    _, key = jax.random.split(key)
     if temperature != 0:
         logits /= temperature
     probs = jax.nn.softmax(logits, axis=-1)
@@ -186,26 +142,16 @@ def sample(logits, key, temperature=0.6):
 
 def main(args):
     # Load weights & tokenizer from huggingface
-    if not args.instruct:
-        model_id = "meta-llama/Llama-3.2-1B"
-        weights = load_file(os.path.join(args.weights, "Llama-3.2-1B.safetensors"))
-        tokenizer = AutoTokenizer.from_pretrained(model_id)
-        tokens: list[int] = tokenizer(args.prompt)["input_ids"]
-    else:
-        model_id = "meta-llama/Llama-3.2-1B-Instruct"
-        weights = load_file(os.path.join(args.weights, "Llama-3.2-1B-Instruct.safetensors"))
-        tokenizer = AutoTokenizer.from_pretrained(model_id)
-        messages = [{"role": "user", "content": args.prompt}]
-        tokens: list[int] = tokenizer.apply_chat_template(
-            messages,
-            tokenize=True,
-            add_generation_prompt=True,
-            return_dict=True,
-        )["input_ids"]
+    model_id = "meta-llama/Llama-3.2-1B"
+    weights = load_file(os.path.join(args.weights, "Llama-3.2-1B.safetensors"))
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
+
+    # Tokenize
+    tokens: list[int] = tokenizer(args.prompt)["input_ids"]
 
     # https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct/blob/main/config.json
     # https://github.com/meta-llama/llama-models/blob/main/models/llama3/api/args.py
-    params = Params(
+    params = SimpleNamespace(
         v=128256,
         n=16,
         d=2048,
@@ -214,7 +160,6 @@ def main(args):
         max_seq_len=2048,
         norm_eps=1e-5,
         rope_theta=500_000.0,
-        rope_scaling=False,
         rope_scale_factor=32,
         rope_high_freq_factor=4.0,
         rope_low_freq_factor=1.0,
@@ -225,7 +170,6 @@ def main(args):
         dim=params.d // params.h,
         ctx_len=params.max_seq_len * 2,
         theta=params.rope_theta,
-        use_scaling=params.rope_scaling,
     )
 
     # Generate
@@ -241,7 +185,6 @@ def main(args):
 
 if __name__ == "__main__":
     parser = ArgumentParser()
-    parser.add_argument("--instruct", action="store_true")
     parser.add_argument("--weights", type=str, help="Weights directory", required=True)
     parser.add_argument("--prompt", type=str, required=True)
     parser.add_argument("--key", type=int, required=True)
