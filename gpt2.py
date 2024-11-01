@@ -154,10 +154,10 @@ def inference(args):
     tokens = enc.encode(args.prompt)
 
     # Use the GPT2 model to get the weights
-    model = GPT2LMHeadModel.from_pretrained("gpt2")
-    weights = model.state_dict()
-    # Convert the weights to JAX arrays
-    weights = {k: jnp.array(v.data.cpu().numpy()) for k, v in weights.items()}
+    # & Convert the weights to JAX arrays
+    weights_ = GPT2LMHeadModel.from_pretrained("gpt2").state_dict()
+    weights = {k: jnp.array(v.data.cpu().numpy()) for k, v in weights_.items()}
+    del weights_
 
     params = Params(n=12, h=12, d=768, d_ff=3072, v=50257)
 
