@@ -34,9 +34,9 @@ class Params:
     rope_low_freq_factor: float
 
 
-def rms_norm(x, gamma, eps, axis=0):
+def rms_norm(x, gamma, eps):
     # https://arxiv.org/pdf/1910.07467
-    return x * gamma / jnp.sqrt(jnp.mean(jnp.pow(x, 2), axis=axis, keepdims=True) + eps)
+    return gamma * x * jax.lax.rsqrt(jnp.mean(jnp.pow(x, 2), axis=-1, keepdims=True) + eps)
 
 
 def swish(x, beta: float):
@@ -58,44 +58,45 @@ def rope_scaling(f):
     low_freq_factor = 1.0
     og_ctx_len = 8192
 
+    # Get wavelengths from frequencies
     wl = 2 * jnp.pi / f
 
+    # Conditions on wavelength
     is_low_wl = wl < (og_ctx_len / low_freq_factor)
     is_high_wl = wl > (og_ctx_len / high_freq_factor)
     is_bound_wl = ~(is_low_wl | is_high_wl)
 
+    # Scale frequencies based on conditions
     scaled_f = f.clone()
     scaled_f[is_high_wl] = f[is_high_wl] / scale_factor
-
     if is_bound_wl.any():
         smooth = (og_ctx_len / wl[is_bound_wl] - low_freq_factor) / (high_freq_factor - low_freq_factor)
         scaled_f[is_bound_wl] = (1 - smooth) * f[is_bound_wl] / scale_factor + smooth * f[is_bound_wl]
-
     return scaled_f
 
 
 def rope_frequencies(dim: int, end: int, theta: float, scaling: bool = False):
     # https://arxiv.org/pdf/2104.09864
     m = jnp.arange(end)
-    t = jnp.pow(theta, -jnp.arange(0, dim, 2)[: dim // 2] / dim)
+    t = 1.0 / (theta ** (jnp.arange(0, dim, 2)[: dim // 2] / dim))
     if scaling:
         t = rope_scaling(t)
     f = jnp.einsum("i, j -> ij", m, t)
     return jnp.cos(f) + 1j * jnp.sin(f)
 
 
-def rope(x, f):
-    _x = x.reshape(*x.shape[:-1], -1, 2).astype(jnp.float32)
-    x_complex = jax.lax.complex(_x[..., 0], _x[..., 1])
-    # >>> NOTE
-    # assert f.shape == (x_complex.shape[1], x_complex.shape[-1])
-    x_rotated = x_complex * f
+def rope(x, f_complex):
+    x = x.reshape(*x.shape[:-1], -1, 2).astype(jnp.float32)
+    x_complex = jax.lax.complex(x[..., 0], x[..., 1])
+    f_complex = jnp.expand_dims(f_complex, 1)
+
+    x_rotated = x_complex * f_complex
     x_out = jnp.stack([x_rotated.real, x_rotated.imag], axis=-1)
-    x_out = rearrange(x_out, "head s k complex -> head s (k complex)")
+    x_out = rearrange(x_out, "s head k complex -> s head (k complex)")
     return x_out
 
 
-def gqa(x, h, h_kv, W_Q, W_K, W_V, W_O, f):
+def gqa(x, h, h_kv, W_Q, W_K, W_V, W_O, f_complex):
     # https://arxiv.org/pdf/2305.13245v3
     _, d = x.shape
 
@@ -105,16 +106,21 @@ def gqa(x, h, h_kv, W_Q, W_K, W_V, W_O, f):
     V = jnp.einsum("ik, jk -> ij", x, W_V)
 
     # Split along head
-    Q = rearrange(Q, "s (head head_dim) -> head s head_dim", head=h)
-    K = rearrange(K, "s (head head_dim) -> head s head_dim", head=h_kv)
-    V = rearrange(V, "s (head head_dim) -> head s head_dim", head=h_kv)
+    Q = rearrange(Q, "s (head head_dim) -> s head head_dim", head=h)
+    K = rearrange(K, "s (head head_dim) -> s head head_dim", head=h_kv)
+    V = rearrange(V, "s (head head_dim) -> s head head_dim", head=h_kv)
 
     # Apply rotary embeddings
-    Q = rope(Q, f)
-    K = rope(K, f)
+    Q = rope(Q, f_complex)
+    K = rope(K, f_complex)
 
     # KV Cache
     # TODO
+
+    # Rearrange to parallelise attention computation across head
+    Q = rearrange(Q, "s head head_dim -> head s head_dim")
+    K = rearrange(K, "s head head_dim -> head s head_dim")
+    V = rearrange(V, "s head head_dim -> head s head_dim")
 
     # Grouped Query / Repeated Key-Value
     K = repeat(K, "head_kv s head_dim -> (head_kv n_rep) s head_dim", n_rep=h // h_kv)
@@ -140,11 +146,11 @@ def gqa(x, h, h_kv, W_Q, W_K, W_V, W_O, f):
     return out
 
 
-def xfmr(tokens, w, params, f, pos):
+def xfmr(tokens, w, params, f_complex, pos):
     s = len(tokens)
 
     x = w["model.embed_tokens.weight"][jnp.array(tokens)]
-    f = f[pos : pos + s]
+    f_complex = f_complex[pos : pos + s]
 
     for i in range(params.n):
         x += gqa(
@@ -155,7 +161,7 @@ def xfmr(tokens, w, params, f, pos):
             W_O=w[f"model.layers.{i}.self_attn.o_proj.weight"],
             h=params.h,
             h_kv=params.h_kv,
-            f=f,
+            f_complex=f_complex,
         )
         x += ffn(
             rms_norm(x, w[f"model.layers.{i}.post_attention_layernorm.weight"], eps=params.norm_eps),
@@ -176,10 +182,10 @@ def xfmr(tokens, w, params, f, pos):
 
 def sample(logits, key):
     probs = jax.nn.softmax(logits, axis=-1)
-    topk_values, topk_indices = jax.lax.top_k(probs, 50)
-    _idx = jrn.choice(key, topk_indices, p=topk_values)
-    sampled_idx = topk_indices[_idx]
-    return sampled_idx
+    topk_probs, topk_indices = jax.lax.top_k(probs, 50)
+    topk_probs /= jnp.sum(topk_probs)
+    idx = jrn.choice(key, topk_indices, p=topk_probs)
+    return idx
 
 
 def main(args):
@@ -231,7 +237,7 @@ def main(args):
     key = jrn.key(args.key)
     for pos in range(args.len):
         _, key = jrn.split(key)
-        logits = xfmr(tokens, weights, params, f=frequencies, pos=pos)
+        logits = xfmr(tokens, weights, params, f_complex=frequencies, pos=pos)
         sampled = sample(logits, key)
         gen = tokenizer.decode([sampled])
         print(gen, end="", flush=True)
@@ -240,10 +246,10 @@ def main(args):
 
 if __name__ == "__main__":
     parser = ArgumentParser()
-    parser.add_argument("--weights", type=str, help="Weights directory")
-    parser.add_argument("--prompt", type=str)
     parser.add_argument("--instruct", action="store_true")
-    parser.add_argument("--key", type=int)
+    parser.add_argument("--weights", type=str, help="Weights directory", required=True)
+    parser.add_argument("--prompt", type=str, required=True)
+    parser.add_argument("--key", type=int, required=True)
     parser.add_argument("--len", type=int, default=50)
     args = parser.parse_args()
     main(args)
