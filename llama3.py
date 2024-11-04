@@ -41,12 +41,39 @@ def rescale_theta(theta_old, ctx_len_old, ctx_len_new):
     return theta_new
 
 
-def rope_frequencies(dim, ctx_len, theta, dtype=jnp.float32):
+# Weird scaling added in from grid search
+def rope_scaling(f, scale_fctr, hi_freq_fctr, lo_freq_fctr, og_ctx_len):
+    # Get wavelengths from frequencies
+    wl = 2 * jnp.pi / f
+
+    # Conditions on wavelength
+    is_lo_wl = wl < (og_ctx_len / lo_freq_fctr)  # Low
+    is_hi_wl = wl > (og_ctx_len / hi_freq_fctr)  # High
+    is_bo_wl = ~(is_lo_wl | is_hi_wl)  # Bound
+
+    # Scale frequencies based on conditions
+    scaled_f = jnp.where(is_hi_wl, f / scale_fctr, f)
+    if is_bo_wl.any():
+        smooth = (og_ctx_len / wl[is_bo_wl] - lo_freq_fctr) / (
+            hi_freq_fctr - lo_freq_fctr
+        )
+        scaled_f = jnp.where(
+            is_bo_wl,
+            (1 - smooth) * f / scale_fctr + smooth * f,
+            scaled_f,
+        )
+
+    return scaled_f
+
+
+def rope_frequencies(dim, ctx_len, theta, scaling=None, dtype=jnp.float32):
     # https://arxiv.org/pdf/2104.09864
     m = jnp.arange(ctx_len, dtype=jnp.float32)
     t = 1.0 / (
         theta ** (jnp.arange(0, dim, 2, dtype=jnp.float32)[: (dim // 2)] / dim)
     )
+    if scaling is not None:
+        t = rope_scaling(t, **scaling)
     f = jnp.einsum("i, j -> ij", m, t)
     f = jnp.concatenate([f, f], axis=-1)
     return jnp.cos(f).astype(dtype), jnp.sin(f).astype(dtype)
@@ -256,20 +283,23 @@ def main(args):
 
     # https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct/blob/main/config.json
     # https://github.com/meta-llama/llama-models/blob/main/models/llama3/api/args.py
-    params = dict(
-        v=128256,
-        n=16,
-        d=2048,
-        h=32,
-        h_kv=8,
-        ctx_len=131_072,
-        norm_eps=1e-5,
-        rope_theta=500_000.0,
-        rope_scale_factor=32,
-        rope_high_freq_factor=4.0,
-        rope_low_freq_factor=1.0,
-        dtype=jnp.bfloat16,
-    )
+    params = {
+        "v": 128256,
+        "n": 16,
+        "d": 2048,
+        "h": 32,
+        "h_kv": 8,
+        "ctx_len": 131_072,
+        "norm_eps": 1e-5,
+        "rope_theta": 500_000.0,
+        "rope_scaling": {
+            "scale_fctr": 32,
+            "hi_freq_fctr": 4.0,
+            "lo_freq_fctr": 1.0,
+            "og_ctx_len": 8192,
+        },
+        "dtype": jnp.bfloat16,
+    }
 
     # Reduce context len & rescale theta
     params["rope_theta"] = rescale_theta(
@@ -284,11 +314,12 @@ def main(args):
         dim=params["d"] // params["h"],
         ctx_len=params["ctx_len"],
         theta=params["rope_theta"],
+        scaling=params["rope_scaling"],
         dtype=params["dtype"],
     )
 
     # Downcasst weights
-    weights = {k: v.astype(params["dtype"]) for k, v in weights.items()}  #  type: ignore
+    weights = {k: v.astype(params["dtype"]) for k, v in weights.items()}
 
     # Generate
     key = jax.random.PRNGKey(args.key)
