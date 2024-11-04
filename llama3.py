@@ -23,15 +23,14 @@ def rms_norm(x, gamma, eps):
     )
 
 
-def swish(x, beta: float):
-    # https://arxiv.org/pdf/1710.05941v1
-    return x * jax.nn.sigmoid(beta * x)
+def swish(x, b: float):
+    return x * jax.lax.logistic(x * b)
 
 
-def ffn(x, W1, V, W2):
+def ffn(x, W1, W2, W3):
     # https://arxiv.org/pdf/2002.05202v1
-    x = swish(jnp.dot(x, W1.T), beta=1.0) * jnp.dot(x, V.T)
-    x = jnp.dot(x, W2.T)
+    x = swish(jnp.dot(x, W1.T), b=1.0) * jnp.dot(x, W2.T)
+    x = jnp.dot(x, W3.T)
     return x
 
 
@@ -129,10 +128,10 @@ def gqa(x, h, h_kv, W_Q, W_K, W_V, W_O, f_cos, f_sin):
     return out
 
 
-def xfmr(tokens, w, params, f_cos, f_sin, pos):
+def xfmr(tokens, w, params, f_cos, f_sin):
     s = len(tokens)
 
-    f_cos, f_sin = f_cos[pos : pos + s], f_sin[pos : pos + s]
+    f_cos, f_sin = f_cos[:s, :], f_sin[:s, :]
     x = w["model.embed_tokens.weight"][jnp.array(tokens)]
 
     for i in range(params["n"]):
@@ -163,19 +162,19 @@ def xfmr(tokens, w, params, f_cos, f_sin, pos):
         )
         x = ffn(
             x,
-            W1=w[f"model.layers.{i}.mlp.up_proj.weight"],
-            W2=w[f"model.layers.{i}.mlp.down_proj.weight"],
-            V=w[f"model.layers.{i}.mlp.gate_proj.weight"],
+            W1=w[f"model.layers.{i}.mlp.gate_proj.weight"],
+            W2=w[f"model.layers.{i}.mlp.up_proj.weight"],
+            W3=w[f"model.layers.{i}.mlp.down_proj.weight"],
         )
         x += r
 
     x = rms_norm(x, w["model.norm.weight"], eps=params["norm_eps"])
 
-    logits = jnp.einsum("ik, kj -> ij", x, w["model.embed_tokens.weight"].T)
+    logits = jnp.einsum("ik, jk -> ij", x, w["model.embed_tokens.weight"])
     return logits[-1, :]
 
 
-def sample(logits, key, temperature=0.6):
+def sample(logits, key, temperature=0.6) -> int:
     _, key = jax.random.split(key)
     if temperature != 0:
         logits /= temperature
@@ -183,7 +182,7 @@ def sample(logits, key, temperature=0.6):
     topk_probs, topk_indices = jax.lax.top_k(probs, 50)
     topk_probs /= jnp.sum(topk_probs)
     idx = jax.random.choice(key, topk_indices, p=topk_probs)
-    return idx
+    return int(idx)
 
 
 class Tokenizer:
@@ -323,12 +322,15 @@ def main(args):
 
     # Generate
     key = jax.random.PRNGKey(args.key)
-    for pos in range(args.len):
+    for _ in range(args.len):
+        logits = xfmr(tokens, weights, params, f_cos, f_sin)
+
         _, key = jax.random.split(key)
-        logits = xfmr(tokens, weights, params, f_cos, f_sin, pos=pos)
         sampled = sample(logits, key)
         gen = tokenizer.decode([sampled])
+
         print(gen, end="", flush=True)
+        tokens.append(sampled)
     print()
 
 
