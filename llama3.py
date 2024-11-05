@@ -1,4 +1,5 @@
 from argparse import ArgumentParser
+from functools import partial
 from pathlib import Path
 
 import jax
@@ -14,6 +15,7 @@ from tiktoken.load import load_tiktoken_bpe
 # Sebastian Raschka: https://github.com/rasbt/LLMs-from-scratch/blob/main/ch05/07_gpt_to_llama/standalone-llama32.ipynb
 
 
+@jax.jit
 def rms_norm(x, gamma, eps):
     # https://arxiv.org/pdf/1910.07467
     return (
@@ -23,10 +25,12 @@ def rms_norm(x, gamma, eps):
     )
 
 
+@jax.jit
 def swish(x, b: float):
     return x * jax.lax.logistic(x * b)
 
 
+@jax.jit
 def ffn(x, W1, W2, W3):
     # https://arxiv.org/pdf/2002.05202v1
     x = swish(jnp.dot(x, W1.T), b=1.0) * jnp.dot(x, W2.T)
@@ -78,6 +82,7 @@ def rope_frequencies(dim, ctx_len, theta, scaling=None, dtype=jnp.float32):
     return jnp.cos(f).astype(dtype), jnp.sin(f).astype(dtype)
 
 
+@jax.jit
 def rope(x, f_cos, f_sin):
     # https://arxiv.org/pdf/2104.09864
     x1, x2 = jnp.split(x, 2, axis=-1)
@@ -86,6 +91,7 @@ def rope(x, f_cos, f_sin):
     return x_rotated
 
 
+@partial(jax.jit, static_argnames=["h", "h_kv"])
 def gqa(x, h, h_kv, W_Q, W_K, W_V, W_O, f_cos, f_sin):
     s, _ = x.shape
 
